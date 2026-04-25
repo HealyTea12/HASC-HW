@@ -1,0 +1,9 @@
+Cores: 4
+Hyperthreads: 2 per core
+Min frequency: 400 MHz
+Max frequency: 4.6 GHz
+Instruction sets: avx2 bmi2
+L1: 128 KiB
+L2: 1 MiB
+L3: 8 MiB
+Memory Bandwidth (stream benchmark): 10GB/s
