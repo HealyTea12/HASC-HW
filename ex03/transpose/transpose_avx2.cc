@@ -3,7 +3,7 @@
 #include <immintrin.h>
 #include <cassert>
 
-#include "../vectorclass.h"
+#include "vectorclass.h"
 
 #include "time_experiment.hh"
 
