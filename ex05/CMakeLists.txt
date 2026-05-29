@@ -14,3 +14,6 @@ FetchContent_MakeAvailable(googletest)
 add_executable(barrier_test barrier_test.cpp)
 find_package(OpenMP REQUIRED)
 target_link_libraries(barrier_test GTest::gtest GTest::gtest_main OpenMP::OpenMP_CXX)
+
+add_executable(barrier_profiling barrier_profiling.cpp)
+target_link_libraries(barrier_profiling benchmark::benchmark_main OpenMP::OpenMP_CXX)
