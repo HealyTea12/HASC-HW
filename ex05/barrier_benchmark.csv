@@ -1,0 +1,14 @@
+2026-05-29T17:55:01+02:00
+Running ./build/ex05/barrier_profiling
+Run on (8 X 4600 MHz CPU s)
+CPU Caches:
+  L1 Data 32 KiB (x4)
+  L1 Instruction 32 KiB (x4)
+  L2 Unified 256 KiB (x4)
+  L3 Unified 8192 KiB (x1)
+Load Average: 4.36, 4.77, 4.57
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+name,iterations,real_time,cpu_time,time_unit,bytes_per_second,items_per_second,label,error_occurred,error_message
+"Barrier/1000/real_time",10,6.47948e+07,1.67139e+07,ns,,0,,,
+"CounterBarrier/1000/real_time",830,901253,803005,ns,,0,,,
+"TreeBarrier/1000/real_time",634,2.94768e+06,2.50628e+06,ns,,0,,,
