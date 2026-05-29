@@ -19,3 +19,5 @@ add_executable(bench
 target_link_libraries(bench
     benchmark::benchmark
 )
+
+add_subdirectory(ex05)
