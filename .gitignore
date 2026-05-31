@@ -2,3 +2,21 @@ ex03/my_machine_info.md
 
 /env
 ex03/transpose/results/transpose_analysis.html
+
+# Build outputs
+build/
+**/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Generated binaries
+ex05/exercise02/nbody_cpp
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*~
