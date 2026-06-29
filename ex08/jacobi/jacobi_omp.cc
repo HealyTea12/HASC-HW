@@ -8,6 +8,10 @@
 #include <memory>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 struct GlobalContext
 {
   // input data
@@ -58,6 +62,31 @@ void jacobi_vanilla(std::shared_ptr<GlobalContext> &context)
 // against the sequential reference and to measure throughput.
 // ===========================================================================
 
+void jacobi_omp_kernel(int n, int iterations, double *__restrict__ uold,
+                       double *__restrict__ unew)
+{
+#pragma omp parallel
+  {
+    for (int it = 1; it <= iterations; it++)
+    {
+#pragma omp for schedule(static)
+      for (int i1 = 1; i1 < n - 1; i1++)
+        for (int i0 = 1; i0 < n - 1; i0++)
+          unew[i1 * n + i0] =
+              0.25 * (uold[i1 * n + i0 - n] + uold[i1 * n + i0 - 1] +
+                      uold[i1 * n + i0 + 1] + uold[i1 * n + i0 + n]);
+
+#pragma omp single
+      std::swap(uold, unew);
+    }
+  }
+}
+
+void jacobi_omp(std::shared_ptr<GlobalContext> &context)
+{
+  jacobi_omp_kernel(context->n, context->iterations, context->u0, context->u1);
+}
+
 int main(int argc, char **argv)
 {
   // read parameters
@@ -72,6 +101,11 @@ int main(int argc, char **argv)
   std::cout << "jacobi: n=" << n << " iterations=" << iterations
             << " memory (mbytes)=" << (n * n) * 8.0 * 2.0 / 1024.0 / 1024.0
             << std::endl;
+  int threads = 1;
+#ifdef _OPENMP
+  threads = omp_get_max_threads();
+#endif
+  std::cout << "OpenMP threads=" << threads << std::endl;
 
   const double updates = double(iterations) * (n - 2) * (n - 2);
 
@@ -132,7 +166,6 @@ int main(int argc, char **argv)
   verify("vanilla", jacobi_vanilla);
   benchmark("vanilla", jacobi_vanilla);
 
-  // TODO: verify and benchmark your OpenMP kernels here, e.g.
-  //   verify("omp", jacobi_omp);
-  //   benchmark("omp", jacobi_omp);
+  verify("omp", jacobi_omp);
+  benchmark("omp", jacobi_omp);
 }

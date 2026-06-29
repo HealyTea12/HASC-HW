@@ -4,10 +4,12 @@
 #include <iostream>
 #include <memory>
 #include <new>
-#include <utility>
 #include <vector>
 
 #include <mpi.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 struct GlobalContext
 {
@@ -54,14 +56,7 @@ struct JacobiRequests
   MPI_Request recv_down;
 };
 
-// Exchange ghost rows of buffer u with the up/down neighbours.
-//
-// TODO: Send your topmost interior row (row 1) to context->up and receive the
-// neighbour's border row into the top ghost row (row 0); send your bottommost
-// interior row (row context->nloc) to context->down and receive into the bottom
-// ghost row (row context->nloc + 1). context->up / context->down are set to
-// MPI_PROC_NULL at the domain ends, so those sends/receives become no-ops.
-// Use a deadlock-free scheme (MPI_Sendrecv, even/odd ordering, or Isend/Irecv).
+// Exchange ghost rows with non-blocking communication.
 JacobiRequests halo_exchange(MPI_Comm comm, std::shared_ptr<GlobalContext> context, double *__restrict__ u)
 {
   JacobiRequests reqs;
@@ -72,17 +67,6 @@ JacobiRequests halo_exchange(MPI_Comm comm, std::shared_ptr<GlobalContext> conte
   return reqs;
 }
 
-// compute norm of defect on the parallel communicator comm
-double defect_norm(MPI_Comm comm, int n, double *__restrict__ u)
-{
-  double sum = 0.0;
-
-  // TODO: Compute the *squared* local defect norm here. Then reduce it over all ranks
-  // with, e.g., MPI_Allreduce and only then take the square root.
-
-  return sqrt(sum);
-}
-
 void sync_comm(JacobiRequests requests)
 {
   MPI_Wait(&requests.send_up, MPI_STATUS_IGNORE);
@@ -91,12 +75,139 @@ void sync_comm(JacobiRequests requests)
   MPI_Wait(&requests.recv_down, MPI_STATUS_IGNORE);
 }
 
+void halo_exchange_blocking(MPI_Comm comm, std::shared_ptr<GlobalContext> context, double *__restrict__ u)
+{
+  const int n = context->n;
+
+  MPI_Sendrecv(u + n, n, MPI_DOUBLE, context->up, 0,
+               u + (context->nloc + 1) * n, n, MPI_DOUBLE, context->down, 0,
+               comm, MPI_STATUS_IGNORE);
+  MPI_Sendrecv(u + context->nloc * n, n, MPI_DOUBLE, context->down, 1,
+               u, n, MPI_DOUBLE, context->up, 1,
+               comm, MPI_STATUS_IGNORE);
+}
+
+// compute norm of defect on the parallel communicator comm
+double defect_norm(MPI_Comm comm, std::shared_ptr<GlobalContext> context, double *__restrict__ u)
+{
+  JacobiRequests reqs = halo_exchange(comm, context, u);
+  sync_comm(reqs);
+
+  const int n = context->n;
+  double local_sum = 0.0;
+
+  for (int i1 = 1; i1 <= context->nloc; ++i1)
+  {
+    for (int i0 = 1; i0 < n - 1; ++i0)
+    {
+      double d = 4.0 * u[i1 * n + i0] -
+                 (u[i1 * n + i0 - n] +
+                  u[i1 * n + i0 - 1] +
+                  u[i1 * n + i0 + 1] +
+                  u[i1 * n + i0 + n]);
+      local_sum += d * d;
+    }
+  }
+
+  double global_sum = 0.0;
+  MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, comm);
+
+  return sqrt(global_sum);
+}
+
+double defect_norm_hybrid(MPI_Comm comm, std::shared_ptr<GlobalContext> context, double *__restrict__ u)
+{
+  JacobiRequests reqs = halo_exchange(comm, context, u);
+  sync_comm(reqs);
+
+  const int n = context->n;
+  double local_sum = 0.0;
+
+#pragma omp parallel for reduction(+ : local_sum) schedule(static)
+  for (int i1 = 1; i1 <= context->nloc; ++i1)
+  {
+    for (int i0 = 1; i0 < n - 1; ++i0)
+    {
+      double d = 4.0 * u[i1 * n + i0] -
+                 (u[i1 * n + i0 - n] +
+                  u[i1 * n + i0 - 1] +
+                  u[i1 * n + i0 + 1] +
+                  u[i1 * n + i0 + n]);
+      local_sum += d * d;
+    }
+  }
+
+  double global_sum = 0.0;
+  MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, comm);
+
+  return sqrt(global_sum);
+}
+
 void jacobi_update(double *__restrict__ unew, double *__restrict__ uold, int n, int i0, int i1)
 {
   unew[i1 * n + i0] = 0.25 * (uold[i1 * n + i0 - n] +
                               uold[i1 * n + i0 - 1] +
                               uold[i1 * n + i0 + 1] +
                               uold[i1 * n + i0 + n]);
+}
+
+void update_rows(double *__restrict__ unew, double *__restrict__ uold, int n, int first, int last)
+{
+  if (first > last)
+    return;
+
+  for (int i1 = first; i1 <= last; ++i1)
+  {
+    for (int i0 = 1; i0 < n - 1; ++i0)
+      jacobi_update(unew, uold, n, i0, i1);
+  }
+}
+
+void update_rows_omp(double *__restrict__ unew, double *__restrict__ uold, int n, int first, int last)
+{
+  if (first > last)
+    return;
+
+#pragma omp parallel for schedule(static)
+  for (int i1 = first; i1 <= last; ++i1)
+  {
+    for (int i0 = 1; i0 < n - 1; ++i0)
+      jacobi_update(unew, uold, n, i0, i1);
+  }
+}
+
+double defect_norm_sequential(int n, double *__restrict__ u)
+{
+  double sum = 0.0;
+  for (int i1 = 1; i1 < n - 1; ++i1)
+    for (int i0 = 1; i0 < n - 1; ++i0)
+    {
+      double d = 4.0 * u[i1 * n + i0] -
+                 (u[i1 * n + i0 - n] +
+                  u[i1 * n + i0 - 1] +
+                  u[i1 * n + i0 + 1] +
+                  u[i1 * n + i0 + n]);
+      sum += d * d;
+    }
+  return sqrt(sum);
+}
+
+void jacobi_kernel_blocking(MPI_Comm comm, std::shared_ptr<GlobalContext> context)
+{
+  const int n = context->n;
+  const int nloc = context->nloc;
+  double *uold = context->u0;
+  double *unew = context->u1;
+
+  for (int it = 0; it < context->iterations; ++it)
+  {
+    halo_exchange_blocking(comm, context, uold);
+    update_rows(unew, uold, n, 1, nloc);
+    std::swap(uold, unew);
+
+    context->u0 = uold;
+    context->u1 = unew;
+  }
 }
 
 // One Jacobi sweep over the local strip, repeated context->iterations times.
@@ -115,25 +226,13 @@ void jacobi_kernel(MPI_Comm comm, std::shared_ptr<GlobalContext> context)
     JacobiRequests reqs = halo_exchange(comm, context, uold);
 
     // Update interior rows that do not touch the ghost rows
-    for (int i1 = 2; i1 <= nloc - 1; ++i1)
-    {
-      for (int i0 = 1; i0 < n - 1; ++i0)
-      {
-        jacobi_update(unew, uold, n, i0, i1);
-      }
-    }
+    update_rows(unew, uold, n, 2, nloc - 1);
 
     sync_comm(reqs);
 
     // Update the border rows that touch the ghost rows
-    for (int i0 = 1; i0 < n - 1; ++i0)
-    {
-      jacobi_update(unew, uold, n, i0, 1);
-    }
-    for (int i0 = 1; i0 < n - 1; ++i0)
-    {
-      jacobi_update(unew, uold, n, i0, nloc);
-    }
+    update_rows(unew, uold, n, 1, std::min(1, nloc));
+    update_rows(unew, uold, n, std::max(2, nloc), nloc);
 
     std::swap(uold, unew);
 
@@ -143,14 +242,57 @@ void jacobi_kernel(MPI_Comm comm, std::shared_ptr<GlobalContext> context)
   }
 }
 
-  int main(int argc, char **argv)
+void jacobi_kernel_hybrid(MPI_Comm comm, std::shared_ptr<GlobalContext> context)
+{
+  const int n = context->n;
+  const int nloc = context->nloc;
+  double *uold = context->u0;
+  double *unew = context->u1;
+
+  for (int it = 0; it < context->iterations; ++it)
   {
-    MPI_Init(&argc, &argv);
+    JacobiRequests reqs = halo_exchange(comm, context, uold);
+
+    update_rows_omp(unew, uold, n, 2, nloc - 1);
+
+    sync_comm(reqs);
+
+    update_rows_omp(unew, uold, n, 1, std::min(1, nloc));
+    update_rows_omp(unew, uold, n, std::max(2, nloc), nloc);
+
+    std::swap(uold, unew);
+
+    context->u0 = uold;
+    context->u1 = unew;
+  }
+}
+
+int main(int argc, char **argv)
+{
+    int provided = MPI_THREAD_SINGLE;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
 
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     std::cout << "Rank " << rank << ": Running parallel Jacobi program with " << size << " ranks\n";
+
+    if (provided < MPI_THREAD_FUNNELED)
+    {
+      if (rank == 0)
+        std::cerr << "MPI_THREAD_FUNNELED was requested but not provided\n";
+      MPI_Finalize();
+      return 1;
+    }
+
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    if (rank == 0)
+      std::cout << "MPI thread level: requested FUNNELED, provided " << provided
+                << " (MPI calls stay on the main thread), OpenMP threads/rank: "
+                << threads << "\n";
 
     int n = (argc > 1) ? std::atoi(argv[1]) : 512;
     int iterations = (argc > 2) ? std::atoi(argv[2]) : 1000;
@@ -177,20 +319,62 @@ void jacobi_kernel(MPI_Comm comm, std::shared_ptr<GlobalContext> context)
                  : static_cast<double>(i0 + i1) / n;
     };
 
-    for (int i1 = 0; i1 < context->nloc + 2; ++i1)
+    auto init = [&]()
     {
-      const int global_i1 = context->row_offset + i1 - 1;
-      double *row0 = context->u0 + i1 * n;
-      double *row1 = context->u1 + i1 * n;
-      for (int i0 = 0; i0 < n; ++i0)
+      for (int i1 = 0; i1 < context->nloc + 2; ++i1)
       {
-        const double value = g(i0, global_i1);
-        row0[i0] = value;
-        row1[i0] = value;
+        const int global_i1 = context->row_offset + i1 - 1;
+        double *row0 = context->u0 + i1 * n;
+        double *row1 = context->u1 + i1 * n;
+        for (int i0 = 0; i0 < n; ++i0)
+        {
+          const double value = g(i0, global_i1);
+          row0[i0] = value;
+          row1[i0] = value;
+        }
       }
-    }
+    };
 
+    init();
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start = MPI_Wtime();
+    jacobi_kernel_blocking(MPI_COMM_WORLD, context);
+    MPI_Barrier(MPI_COMM_WORLD);
+    double blocking_time = MPI_Wtime() - start;
+
+    init();
+    MPI_Barrier(MPI_COMM_WORLD);
+    start = MPI_Wtime();
     jacobi_kernel(MPI_COMM_WORLD, context);
+    MPI_Barrier(MPI_COMM_WORLD);
+    double overlap_time = MPI_Wtime() - start;
+
+    init();
+    MPI_Barrier(MPI_COMM_WORLD);
+    start = MPI_Wtime();
+    jacobi_kernel_hybrid(MPI_COMM_WORLD, context);
+    MPI_Barrier(MPI_COMM_WORLD);
+    double hybrid_time = MPI_Wtime() - start;
+
+    double max_blocking_time = 0.0;
+    double max_overlap_time = 0.0;
+    double max_hybrid_time = 0.0;
+    MPI_Reduce(&blocking_time, &max_blocking_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&overlap_time, &max_overlap_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&hybrid_time, &max_hybrid_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    double mpi_norm = defect_norm_hybrid(MPI_COMM_WORLD, context, context->u0);
+
+    if (rank == 0)
+    {
+      const double updates = double(iterations) * (n - 2) * (n - 2);
+      std::cout << "blocking:   " << max_blocking_time << " s, "
+                << updates / max_blocking_time / 1e9 << " GUpdates/s\n";
+      std::cout << "overlapped: " << max_overlap_time << " s, "
+                << updates / max_overlap_time / 1e9 << " GUpdates/s\n";
+      std::cout << "hybrid:     " << max_hybrid_time << " s, "
+                << updates / max_hybrid_time / 1e9 << " GUpdates/s\n";
+    }
 
     std::vector<int> recvcounts;
     std::vector<int> displs;
@@ -246,10 +430,19 @@ void jacobi_kernel(MPI_Comm comm, std::shared_ptr<GlobalContext> context)
 
       std::cout << "Verify MPI Jacobi: max diff = " << max_diff
                 << (max_diff < 1e-12 ? "  [PASS]" : "  [FAIL]") << "\n";
+
+      double ref_norm = defect_norm_sequential(n, uold);
+      double norm_diff = std::abs(mpi_norm - ref_norm);
+      double norm_tol = 1e-10 * std::max(1.0, ref_norm);
+      std::cout << "Defect norm: MPI = " << mpi_norm
+                << ", sequential = " << ref_norm
+                << ", diff = " << norm_diff
+                << (norm_diff < norm_tol ? "  [PASS]" : "  [FAIL]")
+                << "\n";
     }
 
     ::operator delete[](context->u1, std::align_val_t(64));
     ::operator delete[](context->u0, std::align_val_t(64));
 
     MPI_Finalize();
-  }
+}
